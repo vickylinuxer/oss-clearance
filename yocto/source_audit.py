@@ -3306,21 +3306,25 @@ def _sanity_check(row: dict) -> dict:
     return {"status": status, "issues": issues}
 
 
+_abs_path_cache: dict[str, Path] = {}  # work_ver key -> source dir
+
+
 def _find_abs_source_path(rel_path: str, pkg: "PackageInfo") -> str:
-    """Reconstruct absolute build-tree path from a collected relative path."""
+    """Reconstruct absolute build-tree path from a collected relative path.
+
+    Uses cached source directory per work_ver to avoid repeated filesystem
+    operations.  The cache is populated on first call per work_ver using
+    ``_find_src_subdir()`` (which consults _WORKDIR_INFRA exclusion set).
+    """
     if pkg.pkg_type in ("kernel_image", "kernel_module") and pkg.kernel:
-        for base in (pkg.kernel.src_dir, pkg.kernel.build_dir):
-            candidate = base / rel_path
-            if candidate.exists():
-                return str(candidate)
         return str(pkg.kernel.src_dir / rel_path)
     if pkg.work_ver:
-        for child in pkg.work_ver.iterdir():
-            if child.is_dir():
-                candidate = child / rel_path
-                if candidate.exists():
-                    return str(candidate)
-        return str(pkg.work_ver / rel_path)
+        wv_key = str(pkg.work_ver)
+        if wv_key not in _abs_path_cache:
+            src = _find_src_subdir(pkg.work_ver, pkg.recipe, ver=pkg.ver)
+            _abs_path_cache[wv_key] = src if src else pkg.work_ver
+        base = _abs_path_cache[wv_key]
+        return str(base / rel_path)
     return rel_path
 
 
@@ -4211,10 +4215,13 @@ class Reporter:
         _auto_width(ws2)
 
         # ── Sheet 3: Source Files ──
+        # For kernel modules, emit only compiled sources (.c/.S) per recipe
+        # (not all ~500 headers per module) to keep XLSX size manageable.
         ws3 = wb.create_sheet("Source Files")
         ws3.append(["Package", "Recipe", "Version", "File Path",
                      "Extension", "DWARF Confirmed"])
         pkg_map = {p.installed_name: p for p in packages}
+        kernel_recipe_done: set[str] = set()
         for r in rows:
             name = r["name"]
             recipe = r["recipe"]
@@ -4225,6 +4232,12 @@ class Reporter:
                 continue
             source_binaries = r.get("source_binaries", {})
             is_kernel = r["type"] in ("kernel_image", "kernel_module")
+            if is_kernel and r["type"] == "kernel_module":
+                # Emit one summary row per kernel module
+                ws3.append([name, recipe, version,
+                            f"({r['cu_total']} files — see CSV for full list)",
+                            "", "Yes"])
+                continue
             pkg_dir = self.out_dir / name
             cu_files = _list_files_in(pkg_dir)
             for f in cu_files:
