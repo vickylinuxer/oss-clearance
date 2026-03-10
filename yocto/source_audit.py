@@ -4054,24 +4054,21 @@ class Reporter:
                 source_binaries = row.get("source_binaries", {})
                 is_kernel = row["type"] in ("kernel_image", "kernel_module")
                 has_dwarf = bool(source_binaries)
-                kernel_compiled: set[str] = set()
+                # Kernel packages: check if any compiled sources exist
+                has_kernel_sources = False
                 if is_kernel and not has_dwarf and pkg:
-                    kernel_compiled = {
-                        r for r in pkg.kernel_mod_obj_rels
-                        if Path(r).suffix.lower() in _COMPILED_EXTS
-                    }
+                    has_kernel_sources = any(
+                        Path(r).suffix.lower() in _COMPILED_EXTS
+                        for r in pkg.kernel_mod_obj_rels
+                    )
+                # If package has confirmed sources (DWARF or kernel obj),
+                # all collected files are needed (including headers)
+                pkg_confirmed = has_dwarf or is_kernel or has_kernel_sources
                 pkg_dir = self.out_dir / name
                 cu_files = _list_files_in(pkg_dir)
                 for f in cu_files:
                     rel = f["path"]
-                    if has_dwarf:
-                        # If DWARF confirmed any .c files for this package,
-                        # all collected files (including .h headers) are needed
-                        deselected = "False"
-                    elif is_kernel and not has_dwarf and rel in kernel_compiled:
-                        deselected = "False"
-                    else:
-                        deselected = "True"
+                    deselected = "False" if pkg_confirmed else "True"
                     abs_path = _find_abs_source_path(rel, pkg) if pkg else rel
                     writer.writerow([row_id, recipe, version, name,
                                      deselected, abs_path])
@@ -4243,17 +4240,11 @@ class Reporter:
             pkg_dir = self.out_dir / name
             cu_files = _list_files_in(pkg_dir)
             has_dwarf = bool(source_binaries)
+            pkg_confirmed = has_dwarf or is_kernel
             for f in cu_files:
                 rel = f["path"]
                 ext = f["ext"]
-                if has_dwarf:
-                    # DWARF confirmed .c files; all collected files
-                    # (including .h headers) are needed
-                    confirmed = "Yes"
-                elif is_kernel:
-                    confirmed = "Yes"
-                else:
-                    confirmed = "No"
+                confirmed = "Yes" if pkg_confirmed else "No"
                 ws3.append([name, recipe, version, rel, ext, confirmed])
             if not cu_files:
                 ws3.append([name, recipe, version, "", "", "No"])
