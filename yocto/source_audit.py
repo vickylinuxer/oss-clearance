@@ -1418,6 +1418,96 @@ def _parse_one_cmd(line: str, cwd: Path) -> CompileCmd | None:
     return CompileCmd(cwd=cwd, cmd=line.strip(), src=src, obj=obj)
 
 
+def _parse_dep_files(work_ver: Path) -> set[Path]:
+    """Parse GCC .d / .deps/*.Plo dependency files to discover headers.
+
+    GCC and libtool/automake generate dependency files listing all headers
+    included during compilation.  Format: ``target: dep1.h dep2.h \\``
+    (continuation lines start with space).  Returns absolute paths of
+    header files that exist on disk.
+    """
+    src_subdir = None
+    # Find source subdir to scope the search
+    for child in work_ver.iterdir():
+        if child.is_dir() and child.name not in _WORKDIR_INFRA:
+            if not child.name.startswith("deploy-") and not child.name.startswith("sstate-"):
+                src_subdir = child
+                break
+    if not src_subdir:
+        return set()
+
+    result: set[Path] = set()
+    dep_patterns = list(src_subdir.rglob("*.d"))
+    dep_patterns.extend(src_subdir.rglob("*.Plo"))
+
+    for dep_file in dep_patterns:
+        try:
+            text = dep_file.read_text(errors="replace")
+        except OSError:
+            continue
+        # Join continuation lines
+        text = text.replace("\\\n", " ")
+        for line in text.splitlines():
+            # Skip empty or comment lines
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            # Format: target: dep1 dep2 ...
+            if ":" in line:
+                _, _, deps_part = line.partition(":")
+            else:
+                deps_part = line
+            for tok in deps_part.split():
+                if not tok or tok == "\\":
+                    continue
+                p = Path(tok)
+                if not p.is_absolute():
+                    p = (dep_file.parent / p).resolve()
+                else:
+                    p = p.resolve()
+                if p.suffix.lower() in SOURCE_EXTS and p.exists():
+                    result.add(p)
+    return result
+
+
+def _extract_force_includes(work_ver: Path) -> set[Path]:
+    """Extract -include <file> headers from compile log commands.
+
+    GCC's ``-include file`` flag force-includes a header before any source
+    is compiled (commonly used for ``config.h``).  Returns absolute paths
+    of force-included files that exist on disk.
+    """
+    log_file = work_ver / "temp" / "log.do_compile"
+    if not log_file.exists():
+        return set()
+    try:
+        lines = log_file.read_text(errors="replace").splitlines()
+    except OSError:
+        return set()
+    cwd = _get_initial_cwd(work_ver)
+    result: set[Path] = set()
+    for line in lines:
+        if " -include " not in line:
+            continue
+        if not _COMPILER_RE.search(line):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            continue
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == "-include" and i + 1 < len(tokens):
+                p = Path(tokens[i + 1])
+                abs_p = p if p.is_absolute() else (cwd / p)
+                abs_p = abs_p.resolve()
+                if abs_p.exists() and abs_p.suffix.lower() in SOURCE_EXTS:
+                    result.add(abs_p)
+                i += 2
+            else:
+                i += 1
+    return result
+
+
 def check_coverage(pkg, sources_dir: Path,
                     all_pkg_names: list[str] | None = None) -> dict:
     """Check how many compiled sources are in the collected output.
@@ -1451,6 +1541,21 @@ def check_coverage(pkg, sources_dir: Path,
         try:
             rel = cmd.src.relative_to(pkg.work_ver)
         except ValueError:
+            # Try resolving work-shared paths
+            src_str = str(cmd.src)
+            if "/work-shared/" in src_str:
+                ws_idx = src_str.find("/work-shared/")
+                ws_rel = src_str[ws_idx + 1:]  # "work-shared/..."
+                after_ws = ws_rel.split("/", 1)[1] if "/" in ws_rel else ""
+                stripped = strip_src_root(after_ws) if after_ws else ""
+                if stripped:
+                    if any((d / stripped).exists() for d in src_dirs):
+                        covered.append(stripped)
+                    else:
+                        not_coll.append(stripped)
+                        if cmd.src.exists():
+                            not_coll_abs[stripped] = cmd.src
+                    continue
             if cmd.src.exists():
                 outside.append(str(cmd.src))
             continue
@@ -1982,6 +2087,13 @@ class Collector:
         print(f"\nDiscovered {len(packages)} packages\n")
         _warn_sstate(packages)
 
+        # Detect split-recipe packages (multiple userspace pkgs from same recipe)
+        _recipe_us_count: dict[str, int] = {}
+        for p in packages:
+            if p.pkg_type == "userspace":
+                _recipe_us_count[p.recipe] = _recipe_us_count.get(p.recipe, 0) + 1
+        self._recipe_has_siblings = {r for r, n in _recipe_us_count.items() if n > 1}
+
         kernel_image_done: dict[tuple[str, str], bool] = {}
         recipes_done: set[str] = set()
         total_lic = 0
@@ -2223,6 +2335,8 @@ class Collector:
 
         counts = {"compiled_used": 0, "missing": 0}
         pkg_out = self.out_dir / pkg_info.installed_name
+        has_siblings = pkg_info.recipe in getattr(
+            self, '_recipe_has_siblings', set())
 
         compiled_srcs: set[Path] = _get_compiled_srcs(pkg_info.work_ver)
 
@@ -2260,33 +2374,87 @@ class Collector:
                     else:
                         counts["missing"] += 1
 
+                # Recipe-level sources (debugsources, compile log, -include,
+                # .d deps) are only safe for single-package recipes.  For
+                # split-package recipes they would add sibling sources.
                 debugsources = pkg_info.work_ver / "debugsources.list"
                 if debugsources.exists():
                     for debug_path in read_debugsources(debugsources):
+                        ext_lower = os.path.splitext(debug_path)[1].lower()
+                        # For split recipes, only collect headers (not .c/.S
+                        # which may belong to sibling packages)
+                        if has_siblings and ext_lower in _COMPILED_EXTS:
+                            continue
+                        if ext_lower not in SOURCE_EXTS:
+                            continue
                         src_h = None
                         dst_rel_h = None
                         if debug_path.startswith(prefix):
                             rel = debug_path[len(prefix):]
-                            if not rel or rel.startswith("<") or not rel.endswith(".h"):
+                            if not rel or rel.startswith("<"):
                                 continue
                             src_h = _resolve_dwarf_source(pkg_info.work_ver, rel) or (pkg_info.work_ver / rel)
                             dst_rel_h = strip_src_root(rel)
                         elif build_dir and "/work-shared/" in debug_path:
-                            if not debug_path.endswith(".h"):
-                                continue
                             ws_idx = debug_path.find("/work-shared/")
                             ws_rel = debug_path[ws_idx + 1:]
                             src_h = tmpdir / ws_rel
                             after_ws = ws_rel.split("/", 1)[1] if "/" in ws_rel else ""
                             dst_rel_h = strip_src_root(after_ws) if after_ws else ""
-                        if src_h and dst_rel_h:
+                        if src_h and dst_rel_h and src_h not in dwarf_abs:
                             if copy_source(src_h, pkg_out / dst_rel_h):
+                                dwarf_abs.add(src_h)
                                 counts["compiled_used"] += 1
+
+                # Supplement: collect compile-log sources missed by DWARF
+                # (assembly .S files, generated .c files not in debug info)
+                # Skip for split recipes — compile log is recipe-level.
+                if not has_siblings and compiled_srcs:
+                    for abs_src in compiled_srcs:
+                        if abs_src in dwarf_abs:
+                            continue
+                        try:
+                            rel = str(abs_src.relative_to(pkg_info.work_ver))
+                        except ValueError:
+                            continue
+                        dst_rel = strip_src_root(rel)
+                        if copy_source(abs_src, pkg_out / dst_rel):
+                            dwarf_abs.add(abs_src)
+                            counts["compiled_used"] += 1
+
+                # Collect -include forced headers (e.g. config.h)
+                # Safe for split recipes — these are headers, not .c/.S.
+                for inc in _extract_force_includes(pkg_info.work_ver):
+                    if inc in dwarf_abs:
+                        continue
+                    try:
+                        rel = str(inc.relative_to(pkg_info.work_ver))
+                    except ValueError:
+                        continue
+                    dst_rel = strip_src_root(rel)
+                    if copy_source(inc, pkg_out / dst_rel):
+                        dwarf_abs.add(inc)
+                        counts["compiled_used"] += 1
+
+                # Collect headers from .d dependency files
+                # Safe for split recipes — .d files list included headers.
+                for dep_h in _parse_dep_files(pkg_info.work_ver):
+                    if dep_h in dwarf_abs:
+                        continue
+                    try:
+                        rel = str(dep_h.relative_to(pkg_info.work_ver))
+                    except ValueError:
+                        continue
+                    dst_rel = strip_src_root(rel)
+                    if copy_source(dep_h, pkg_out / dst_rel):
+                        dwarf_abs.add(dep_h)
+                        counts["compiled_used"] += 1
 
                 return counts
 
             # No DWARF data but compile log has entries — collect from log
-            if compiled_srcs:
+            # (recipe-level: skip compile-log .c/.S for split recipes)
+            if not has_siblings and compiled_srcs:
                 for abs_src in compiled_srcs:
                     try:
                         rel = str(abs_src.relative_to(pkg_info.work_ver))
@@ -2294,6 +2462,31 @@ class Collector:
                         continue
                     dst_rel = strip_src_root(rel)
                     if copy_source(abs_src, pkg_out / dst_rel):
+                        counts["compiled_used"] += 1
+
+                # Collect -include forced headers + .d dep headers
+                collected_abs: set[Path] = set(compiled_srcs)
+                for inc in _extract_force_includes(pkg_info.work_ver):
+                    if inc in collected_abs:
+                        continue
+                    try:
+                        rel = str(inc.relative_to(pkg_info.work_ver))
+                    except ValueError:
+                        continue
+                    dst_rel = strip_src_root(rel)
+                    if copy_source(inc, pkg_out / dst_rel):
+                        collected_abs.add(inc)
+                        counts["compiled_used"] += 1
+                for dep_h in _parse_dep_files(pkg_info.work_ver):
+                    if dep_h in collected_abs:
+                        continue
+                    try:
+                        rel = str(dep_h.relative_to(pkg_info.work_ver))
+                    except ValueError:
+                        continue
+                    dst_rel = strip_src_root(rel)
+                    if copy_source(dep_h, pkg_out / dst_rel):
+                        collected_abs.add(dep_h)
                         counts["compiled_used"] += 1
 
                 return counts
