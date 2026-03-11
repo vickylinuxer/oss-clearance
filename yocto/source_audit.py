@@ -4178,12 +4178,25 @@ class Reporter:
                 # Try full source tree listing
                 tree_files = _get_source_tree_files(pkg)
                 if tree_files is not None:
+                    tree_rels = {f["path"] for f in tree_files}
                     for f in tree_files:
                         rel = f["path"]
                         deselected = "False" if rel in used_rels else "True"
                         writer.writerow([row_id, recipe, version, name,
                                          deselected, f["abs"]])
                         row_id += 1
+                    # Append collected files not in source tree (build-dir
+                    # generated files).
+                    for f in cu_files:
+                        rel = f["path"]
+                        if rel not in tree_rels:
+                            deselected = ("False" if rel in used_rels
+                                          else "True")
+                            abs_path = (_find_abs_source_path(rel, pkg)
+                                        if pkg else rel)
+                            writer.writerow([row_id, recipe, version, name,
+                                             deselected, abs_path])
+                            row_id += 1
                 else:
                     # Fallback: collected files only (kernel modules, sstate)
                     for f in cu_files:
@@ -4364,11 +4377,21 @@ class Reporter:
 
             tree_files = _get_source_tree_files(pkg)
             if tree_files is not None:
+                tree_rels = {f["path"] for f in tree_files}
                 for f in tree_files:
                     rel = f["path"]
                     deselected = "False" if rel in used_rels else "True"
                     ws3.append([name, recipe, version, rel,
                                 f["ext"], deselected])
+                # Append collected files not in source tree (build-dir
+                # generated files).
+                for f in cu_files:
+                    rel = f["path"]
+                    if rel not in tree_rels:
+                        deselected = ("False" if rel in used_rels
+                                      else "True")
+                        ws3.append([name, recipe, version, rel,
+                                    f["ext"], deselected])
             else:
                 for f in cu_files:
                     rel = f["path"]
