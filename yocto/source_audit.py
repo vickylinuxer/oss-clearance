@@ -3283,70 +3283,6 @@ def _get_source_tree_files(pkg: "PackageInfo | None") -> "list[dict] | None":
     return result
 
 
-def _build_used_files_set(row: dict, pkg: "PackageInfo | None") -> "set[str] | None":
-    """Build set of confirmed-used source file paths (relative to collected dir).
-
-    Returns None when ALL collected files are confirmed (kernel_image,
-    kernel_module).  The collector for kernel types only gathers
-    evidence-backed files, so every collected file is used.
-    Returns a set of confirmed paths for userspace packages.
-
-    Evidence sources:
-      - DWARF CU paths: per-package (from this package's ELF binaries). Always safe.
-      - debugsources.list: per-recipe. Only used for single-package recipes (no siblings).
-      - compile log: per-recipe. Only used for single-package recipes (no siblings).
-
-    For split-package recipes (shared work_ver), only per-package DWARF evidence
-    is used — recipe-level sources would falsely confirm files that belong to
-    sibling packages.
-    """
-    pkg_type = row["type"]
-
-    # kernel_image / kernel_module: all collected files are confirmed.
-    # The collector only gathers evidence-backed files (.c/.S from .o/.mod
-    # mapping + .h from .cmd deps), so every collected file is used.
-    if pkg_type in ("kernel_image", "kernel_module"):
-        return None
-
-    if pkg_type != "userspace" or not pkg:
-        return set()  # Unknown type → nothing confirmed
-
-    has_siblings = bool(row.get("shared_with"))
-    evidence = set()
-
-    # Stage 1: debugsources.list (per-recipe — only for single-package recipes)
-    if not has_siblings and pkg.work_ver:
-        dbgsrc = pkg.work_ver / "debugsources.list"
-        if dbgsrc.exists():
-            entries = read_debugsources(dbgsrc)
-            prefix = f"/usr/src/debug/{pkg.recipe}/{pkg.ver}/"
-            for e in entries:
-                if e.startswith(prefix):
-                    evidence.add(strip_src_root(e[len(prefix):]))
-
-    # Stage 2: DWARF CU paths (per-package — always safe)
-    dwarf_cu_rels = row.get("dwarf_cu_rels")
-    if dwarf_cu_rels:
-        evidence.update(dwarf_cu_rels)
-
-    # Stage 3: compile log (per-recipe — only for single-package recipes)
-    if not has_siblings and pkg.work_ver:
-        log = pkg.work_ver / "temp" / "log.do_compile"
-        if log.exists():
-            cwd = _get_initial_cwd(pkg.work_ver)
-            for cmd in parse_compile_log(log, cwd):
-                try:
-                    rel = str(cmd.src.relative_to(pkg.work_ver))
-                    evidence.add(strip_src_root(rel))
-                except ValueError:
-                    pass
-
-    if not evidence:
-        return set()  # No evidence → nothing confirmed
-
-    return evidence
-
-
 def _ext_counts(files: list[dict]) -> dict[str, int]:
     c = Counter(f["ext"] for f in files)
     return dict(sorted(c.items(), key=lambda x: -x[1]))
@@ -4169,11 +4105,10 @@ class Reporter:
                                      "NO_SOURCE_FILES_USED", ""])
                     row_id += 1
                     continue
-                used = _build_used_files_set(row, pkg)
                 pkg_dir = self.out_dir / name
                 cu_files = _list_files_in(pkg_dir)
-                used_rels = {f["path"] for f in cu_files
-                             if used is None or f["path"] in used}
+                # All collected files are considered "used" (False).
+                collected_rels = {f["path"] for f in cu_files}
 
                 # Try full source tree listing
                 tree_files = _get_source_tree_files(pkg)
@@ -4181,7 +4116,8 @@ class Reporter:
                     tree_rels = {f["path"] for f in tree_files}
                     for f in tree_files:
                         rel = f["path"]
-                        deselected = "False" if rel in used_rels else "True"
+                        deselected = ("False" if rel in collected_rels
+                                      else "True")
                         writer.writerow([row_id, recipe, version, name,
                                          deselected, f["abs"]])
                         row_id += 1
@@ -4190,23 +4126,19 @@ class Reporter:
                     for f in cu_files:
                         rel = f["path"]
                         if rel not in tree_rels:
-                            deselected = ("False" if rel in used_rels
-                                          else "True")
                             abs_path = (_find_abs_source_path(rel, pkg)
                                         if pkg else rel)
                             writer.writerow([row_id, recipe, version, name,
-                                             deselected, abs_path])
+                                             "False", abs_path])
                             row_id += 1
                 else:
                     # Fallback: collected files only (kernel modules, sstate)
                     for f in cu_files:
                         rel = f["path"]
-                        deselected = "False" if (used is None
-                                                 or rel in used) else "True"
                         abs_path = (_find_abs_source_path(rel, pkg)
                                     if pkg else rel)
                         writer.writerow([row_id, recipe, version, name,
-                                         deselected, abs_path])
+                                         "False", abs_path])
                         row_id += 1
                 if not cu_files and tree_files is None:
                     writer.writerow([row_id, recipe, version, name, "True", ""])
@@ -4369,18 +4301,17 @@ class Reporter:
                             "", "False"])
                 continue
             pkg = pkg_map.get(name)
-            used = _build_used_files_set(r, pkg)
             pkg_dir = self.out_dir / name
             cu_files = _list_files_in(pkg_dir)
-            used_rels = {f["path"] for f in cu_files
-                         if used is None or f["path"] in used}
+            collected_rels = {f["path"] for f in cu_files}
 
             tree_files = _get_source_tree_files(pkg)
             if tree_files is not None:
                 tree_rels = {f["path"] for f in tree_files}
                 for f in tree_files:
                     rel = f["path"]
-                    deselected = "False" if rel in used_rels else "True"
+                    deselected = ("False" if rel in collected_rels
+                                  else "True")
                     ws3.append([name, recipe, version, rel,
                                 f["ext"], deselected])
                 # Append collected files not in source tree (build-dir
@@ -4388,17 +4319,13 @@ class Reporter:
                 for f in cu_files:
                     rel = f["path"]
                     if rel not in tree_rels:
-                        deselected = ("False" if rel in used_rels
-                                      else "True")
                         ws3.append([name, recipe, version, rel,
-                                    f["ext"], deselected])
+                                    f["ext"], "False"])
             else:
                 for f in cu_files:
                     rel = f["path"]
-                    deselected = ("False" if (used is None or rel in used)
-                                  else "True")
                     ws3.append([name, recipe, version, rel,
-                                f["ext"], deselected])
+                                f["ext"], "False"])
             if not cu_files and tree_files is None:
                 ws3.append([name, recipe, version, "", "", "True"])
         _style_header(ws3)
