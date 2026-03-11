@@ -3240,42 +3240,73 @@ def _list_files_in(d: Path) -> list[dict]:
     return result
 
 
+_src_tree_cache: dict[str, list[dict]] = {}
+
+
+def _get_source_tree_files(pkg: "PackageInfo | None") -> "list[dict] | None":
+    """Scan the full source directory for all source-extension files.
+
+    Returns a list of ``{"path": rel, "ext": ext, "abs": abs_path}`` for every
+    file with a SOURCE_EXTS extension found under the recipe's source dir.
+    Returns ``None`` when unavailable (kernel_module, no work_ver, sstate).
+    Results are cached by source dir path.
+    """
+    if not pkg:
+        return None
+    # Kernel modules: skip — the full kernel tree would produce ~49K entries
+    # per module (×1617 modules).  Use collected-files-only for these.
+    if pkg.pkg_type == "kernel_module":
+        return None
+    # Determine source directory
+    if pkg.pkg_type == "kernel_image" and pkg.kernel:
+        src_dir = pkg.kernel.src_dir
+    elif pkg.work_ver:
+        src_dir = _find_src_subdir(pkg.work_ver, pkg.recipe, ver=pkg.ver)
+    else:
+        return None
+    if not src_dir or not src_dir.is_dir():
+        return None
+    cache_key = str(src_dir)
+    if cache_key in _src_tree_cache:
+        return _src_tree_cache[cache_key]
+    result: list[dict] = []
+    for f in src_dir.rglob("*"):
+        if not f.is_file():
+            continue
+        ext = f.suffix.lower()
+        if ext not in SOURCE_EXTS:
+            continue
+        rel = str(f.relative_to(src_dir))
+        result.append({"path": rel, "ext": ext or "(no ext)",
+                        "abs": str(f)})
+    _src_tree_cache[cache_key] = result
+    return result
+
+
 def _build_used_files_set(row: dict, pkg: "PackageInfo | None") -> "set[str] | None":
     """Build set of confirmed-used source file paths (relative to collected dir).
 
-    Returns None when ALL collected files are confirmed (kernel_image only).
-    Returns a set of confirmed paths for all other package types.
+    Returns None when ALL collected files are confirmed (kernel_image,
+    kernel_module).  The collector for kernel types only gathers
+    evidence-backed files, so every collected file is used.
+    Returns a set of confirmed paths for userspace packages.
 
     Evidence sources:
       - DWARF CU paths: per-package (from this package's ELF binaries). Always safe.
       - debugsources.list: per-recipe. Only used for single-package recipes (no siblings).
       - compile log: per-recipe. Only used for single-package recipes (no siblings).
-      - kernel_mod_obj_rels: per-module .o → .c/.S mapping from .mod files.
 
     For split-package recipes (shared work_ver), only per-package DWARF evidence
     is used — recipe-level sources would falsely confirm files that belong to
     sibling packages.
-
-    For kernel modules, only the .c/.S compiled sources (from .mod → .o mapping)
-    are confirmed. Headers from .cmd deps are shared kernel infrastructure and
-    are deselected (they are already confirmed in kernel-image-image).
     """
     pkg_type = row["type"]
 
-    # kernel_image: all files are the master set, all confirmed
-    if pkg_type == "kernel_image":
+    # kernel_image / kernel_module: all collected files are confirmed.
+    # The collector only gathers evidence-backed files (.c/.S from .o/.mod
+    # mapping + .h from .cmd deps), so every collected file is used.
+    if pkg_type in ("kernel_image", "kernel_module"):
         return None
-
-    # Kernel modules: only .c/.S from .mod obj_rels are confirmed
-    if pkg_type == "kernel_module":
-        if not pkg or not pkg.kernel_mod_obj_rels:
-            return set()  # No .mod evidence → nothing confirmed
-        evidence: set[str] = set()
-        for obj_rel in pkg.kernel_mod_obj_rels:
-            p = Path(obj_rel)
-            for ext in (".c", ".S"):
-                evidence.add(str(p.parent / (p.stem + ext)))
-        return evidence
 
     if pkg_type != "userspace" or not pkg:
         return set()  # Unknown type → nothing confirmed
@@ -4141,17 +4172,30 @@ class Reporter:
                 used = _build_used_files_set(row, pkg)
                 pkg_dir = self.out_dir / name
                 cu_files = _list_files_in(pkg_dir)
-                for f in cu_files:
-                    rel = f["path"]
-                    if used is None or rel in used:
-                        deselected = "False"
-                    else:
-                        deselected = "True"
-                    abs_path = _find_abs_source_path(rel, pkg) if pkg else rel
-                    writer.writerow([row_id, recipe, version, name,
-                                     deselected, abs_path])
-                    row_id += 1
-                if not cu_files:
+                used_rels = {f["path"] for f in cu_files
+                             if used is None or f["path"] in used}
+
+                # Try full source tree listing
+                tree_files = _get_source_tree_files(pkg)
+                if tree_files is not None:
+                    for f in tree_files:
+                        rel = f["path"]
+                        deselected = "False" if rel in used_rels else "True"
+                        writer.writerow([row_id, recipe, version, name,
+                                         deselected, f["abs"]])
+                        row_id += 1
+                else:
+                    # Fallback: collected files only (kernel modules, sstate)
+                    for f in cu_files:
+                        rel = f["path"]
+                        deselected = "False" if (used is None
+                                                 or rel in used) else "True"
+                        abs_path = (_find_abs_source_path(rel, pkg)
+                                    if pkg else rel)
+                        writer.writerow([row_id, recipe, version, name,
+                                         deselected, abs_path])
+                        row_id += 1
+                if not cu_files and tree_files is None:
                     writer.writerow([row_id, recipe, version, name, "True", ""])
                     row_id += 1
         return csv_path
@@ -4292,13 +4336,11 @@ class Reporter:
         _auto_width(ws2)
 
         # ── Sheet 3: Source Files ──
-        # For kernel modules, emit only compiled sources (.c/.S) per recipe
-        # (not all ~500 headers per module) to keep XLSX size manageable.
+        # Lists full source tree when available; kernel modules use summary row.
         ws3 = wb.create_sheet("Source Files")
         ws3.append(["Package", "Recipe", "Version", "File Path",
-                     "Extension", "DWARF Confirmed"])
+                     "Extension", "Deselected"])
         pkg_map = {p.installed_name: p for p in packages}
-        kernel_recipe_done: set[str] = set()
         for r in rows:
             name = r["name"]
             recipe = r["recipe"]
@@ -4311,19 +4353,31 @@ class Reporter:
                 # Emit one summary row per kernel module
                 ws3.append([name, recipe, version,
                             f"({r['cu_total']} files — see CSV for full list)",
-                            "", "Yes"])
+                            "", "False"])
                 continue
             pkg = pkg_map.get(name)
             used = _build_used_files_set(r, pkg)
             pkg_dir = self.out_dir / name
             cu_files = _list_files_in(pkg_dir)
-            for f in cu_files:
-                rel = f["path"]
-                ext = f["ext"]
-                confirmed = "Yes" if (used is None or rel in used) else "No"
-                ws3.append([name, recipe, version, rel, ext, confirmed])
-            if not cu_files:
-                ws3.append([name, recipe, version, "", "", "No"])
+            used_rels = {f["path"] for f in cu_files
+                         if used is None or f["path"] in used}
+
+            tree_files = _get_source_tree_files(pkg)
+            if tree_files is not None:
+                for f in tree_files:
+                    rel = f["path"]
+                    deselected = "False" if rel in used_rels else "True"
+                    ws3.append([name, recipe, version, rel,
+                                f["ext"], deselected])
+            else:
+                for f in cu_files:
+                    rel = f["path"]
+                    deselected = ("False" if (used is None or rel in used)
+                                  else "True")
+                    ws3.append([name, recipe, version, rel,
+                                f["ext"], deselected])
+            if not cu_files and tree_files is None:
+                ws3.append([name, recipe, version, "", "", "True"])
         _style_header(ws3)
         _auto_width(ws3)
 
