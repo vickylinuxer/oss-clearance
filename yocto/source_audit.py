@@ -3240,20 +3240,84 @@ def _list_files_in(d: Path) -> list[dict]:
     return result
 
 
+def _build_used_files_set(row: dict, pkg: "PackageInfo | None") -> "set[str] | None":
+    """Build set of confirmed-used source file paths (relative to collected dir).
+
+    Returns None when ALL collected files are confirmed (kernel packages,
+    or no evidence available — conservative assumption).
+
+    Evidence sources:
+      - DWARF CU paths: per-package (from this package's ELF binaries). Always safe.
+      - debugsources.list: per-recipe. Only used for single-package recipes (no siblings).
+      - compile log: per-recipe. Only used for single-package recipes (no siblings).
+
+    For split-package recipes (shared work_ver), only per-package DWARF evidence
+    is used — recipe-level sources would falsely confirm files that belong to
+    sibling packages.
+    """
+    pkg_type = row["type"]
+
+    # Kernel packages: collector only collects evidence-backed files
+    if pkg_type in ("kernel_image", "kernel_module"):
+        return None
+
+    if pkg_type != "userspace" or not pkg or not pkg.work_ver:
+        return None  # No evidence → conservative: all confirmed
+
+    has_siblings = bool(row.get("shared_with"))
+    evidence: set[str] = set()
+
+    # Stage 1: debugsources.list (per-recipe — only for single-package recipes)
+    if not has_siblings:
+        dbgsrc = pkg.work_ver / "debugsources.list"
+        if dbgsrc.exists():
+            entries = read_debugsources(dbgsrc)
+            prefix = f"/usr/src/debug/{pkg.recipe}/{pkg.ver}/"
+            for e in entries:
+                if e.startswith(prefix):
+                    evidence.add(strip_src_root(e[len(prefix):]))
+
+    # Stage 2: DWARF CU paths (per-package — always safe)
+    dwarf_cu_rels = row.get("dwarf_cu_rels")
+    if dwarf_cu_rels:
+        evidence.update(dwarf_cu_rels)
+
+    # Stage 3: compile log (per-recipe — only for single-package recipes)
+    if not has_siblings:
+        log = pkg.work_ver / "temp" / "log.do_compile"
+        if log.exists():
+            cwd = _get_initial_cwd(pkg.work_ver)
+            for cmd in parse_compile_log(log, cwd):
+                try:
+                    rel = str(cmd.src.relative_to(pkg.work_ver))
+                    evidence.add(strip_src_root(rel))
+                except ValueError:
+                    pass
+
+    if not evidence:
+        return None  # No evidence → conservative: all confirmed
+
+    return evidence
+
+
 def _ext_counts(files: list[dict]) -> dict[str, int]:
     c = Counter(f["ext"] for f in files)
     return dict(sorted(c.items(), key=lambda x: -x[1]))
 
 
 def _dwarf_cross_check(installed_files: list[dict], pkg_split: Path,
-                        cu_file_set: set[str]) -> dict:
+                        cu_file_set: set[str],
+                        recipe: str = "", ver: str = "") -> dict:
     binary_sources: dict[str, list[str]] = {}
     source_binaries: dict[str, list[str]] = {}
+    dwarf_cu_rels: set[str] = set()
 
     # Pre-index collected files by basename for O(1) lookup
     cu_by_basename: dict[str, list[str]] = {}
     for p in cu_file_set:
         cu_by_basename.setdefault(os.path.basename(p), []).append(p)
+
+    prefix = f"/usr/src/debug/{recipe}/{ver}/" if recipe else ""
 
     for f in installed_files:
         if not f["is_elf"]:
@@ -3269,13 +3333,17 @@ def _dwarf_cross_check(installed_files: list[dict], pkg_split: Path,
         for dpath in dwarf_srcs:
             dbase = os.path.basename(dpath)
             matched.extend(cu_by_basename.get(dbase, []))
+            # Collect raw DWARF CU relative paths for used-files evidence
+            if prefix and dpath.startswith(prefix):
+                dwarf_cu_rels.add(strip_src_root(dpath[len(prefix):]))
         matched = sorted(set(matched))
         if matched:
             binary_sources[f["path"]] = matched
             for src in matched:
                 source_binaries.setdefault(src, []).append(f["path"])
 
-    return {"binary_sources": binary_sources, "source_binaries": source_binaries}
+    return {"binary_sources": binary_sources, "source_binaries": source_binaries,
+            "dwarf_cu_rels": dwarf_cu_rels}
 
 
 def _sanity_check(row: dict) -> dict:
@@ -3887,11 +3955,13 @@ class Reporter:
                 pkgdata_runtime, pkg.yocto_pkg,
                 pkg_split=pkg_split)
 
-            xcheck: dict = {"binary_sources": {}, "source_binaries": {}}
+            xcheck: dict = {"binary_sources": {}, "source_binaries": {},
+                           "dwarf_cu_rels": set()}
             elf_count = sum(1 for f in installed_files if f["is_elf"])
             if elf_count and pkg_split and cu_files:
                 cu_path_set = {f["path"] for f in cu_files}
-                xcheck = _dwarf_cross_check(installed_files, pkg_split, cu_path_set)
+                xcheck = _dwarf_cross_check(installed_files, pkg_split,
+                                            cu_path_set, pkg.recipe, pkg.ver)
 
             # License and metadata
             metadata = get_pkg_metadata(pkgdata_runtime, pkg.yocto_pkg)
@@ -3981,6 +4051,7 @@ class Reporter:
                 "installed_elf":   elf_count,
                 "binary_sources":  xcheck["binary_sources"],
                 "source_binaries": xcheck["source_binaries"],
+                "dwarf_cu_rels":   sorted(xcheck["dwarf_cu_rels"]),
                 "license":         license_str,
                 "copyleft":        copyleft,
                 "obligations":     obligations,
@@ -4051,40 +4122,12 @@ class Reporter:
                                      "NO_SOURCE_FILES_USED", ""])
                     row_id += 1
                     continue
-                source_binaries = row.get("source_binaries", {})
-                is_kernel = row["type"] in ("kernel_image", "kernel_module")
-                has_dwarf = bool(source_binaries)
-                # Kernel packages: build set of confirmed compiled sources
-                # kernel_mod_obj_rels has .o paths; map to .c/.S collected names
-                kernel_compiled: set[str] = set()
-                if is_kernel and pkg:
-                    for obj_rel in pkg.kernel_mod_obj_rels:
-                        p = Path(obj_rel)
-                        for ext in (".c", ".S"):
-                            kernel_compiled.add(
-                                str(p.parent / (p.stem + ext))
-                            )
-                # kernel_image collects via .o scanning (all files confirmed)
-                is_kernel_image = row["type"] == "kernel_image"
-                has_confirmed = has_dwarf or is_kernel_image or bool(kernel_compiled)
+                used = _build_used_files_set(row, pkg)
                 pkg_dir = self.out_dir / name
                 cu_files = _list_files_in(pkg_dir)
                 for f in cu_files:
                     rel = f["path"]
-                    ext = f["ext"].lower()
-                    is_header = ext in (".h", ".hh", ".hpp", ".hxx",
-                                        ".def", ".tbl", ".inc")
-                    if rel in source_binaries:
-                        # DWARF-confirmed compiled source
-                        deselected = "False"
-                    elif rel in kernel_compiled:
-                        # Kernel .mod-confirmed compiled source
-                        deselected = "False"
-                    elif is_kernel_image:
-                        # kernel_image: all files confirmed via .o scanning
-                        deselected = "False"
-                    elif is_header and has_confirmed:
-                        # Header in a package with confirmed sources
+                    if used is None or rel in used:
                         deselected = "False"
                     else:
                         deselected = "True"
@@ -4248,31 +4291,20 @@ class Reporter:
                 ws3.append([name, recipe, version, "",
                             "", "NO_SOURCE_FILES_USED"])
                 continue
-            source_binaries = r.get("source_binaries", {})
-            is_kernel = r["type"] in ("kernel_image", "kernel_module")
-            if is_kernel and r["type"] == "kernel_module":
+            if r["type"] == "kernel_module":
                 # Emit one summary row per kernel module
                 ws3.append([name, recipe, version,
                             f"({r['cu_total']} files — see CSV for full list)",
                             "", "Yes"])
                 continue
+            pkg = pkg_map.get(name)
+            used = _build_used_files_set(r, pkg)
             pkg_dir = self.out_dir / name
             cu_files = _list_files_in(pkg_dir)
-            has_dwarf = bool(source_binaries)
-            has_confirmed = has_dwarf or is_kernel
             for f in cu_files:
                 rel = f["path"]
                 ext = f["ext"]
-                is_header = ext.lower() in (".h", ".hh", ".hpp", ".hxx",
-                                             ".def", ".tbl", ".inc")
-                if rel in source_binaries:
-                    confirmed = "Yes"
-                elif is_kernel:
-                    confirmed = "Yes"
-                elif is_header and has_confirmed:
-                    confirmed = "Yes"
-                else:
-                    confirmed = "No"
+                confirmed = "Yes" if (used is None or rel in used) else "No"
                 ws3.append([name, recipe, version, rel, ext, confirmed])
             if not cu_files:
                 ws3.append([name, recipe, version, "", "", "No"])
