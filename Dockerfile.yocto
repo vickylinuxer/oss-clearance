@@ -1,0 +1,26 @@
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+RUN apt-get update && apt-get install -y \
+    locales \
+    && locale-gen en_US.UTF-8 \
+    && apt-get install -y \
+    gawk wget git diffstat unzip texinfo gcc build-essential \
+    chrpath socat cpio python3 python3-pip python3-pexpect \
+    python3-git python3-jinja2 xz-utils debianutils iputils-ping \
+    libsdl1.2-dev xterm lz4 zstd file \
+    binutils-aarch64-linux-gnu \
+    python3-openpyxl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} builder 2>/dev/null || true \
+    && useradd -m -u ${UID} -g ${GID} -s /bin/bash builder 2>/dev/null || true
+
+USER builder
+WORKDIR /home/builder

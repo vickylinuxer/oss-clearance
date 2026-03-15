@@ -56,7 +56,7 @@ There is no test suite, linter, or build system.
 
 ## Architecture
 
-Single-file script: `yocto/source_audit.py` (~4900 lines)
+Single-file script: `yocto/source_audit.py` (~5400 lines)
 
 The script is organized into logical sections:
 

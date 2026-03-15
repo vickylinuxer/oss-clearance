@@ -3661,17 +3661,53 @@ def _find_abs_source_path(rel_path: str, pkg: "PackageInfo") -> str:
     return rel_path
 
 
-_GCC_VER_RE = re.compile(r'^gcc-(\d+\.\d+\.\d+)/(.*)')
+# Matches toolchain source prefixes embedded by DWARF -fdebug-prefix-map,
+# e.g. "gcc-9.5.0/libgcc/...", "clang-15.0.7/lib/...", "llvm-15.0.7/...".
+_TOOLCHAIN_SRC_RE = re.compile(
+    r'^([a-zA-Z][a-zA-Z0-9_+-]*)-(\d+\.\d+(?:\.\d+)*)/(.*)')
+
+
+def _get_tmpdir(work_ver: Path) -> Path:
+    """Return the TMPDIR (e.g. .../tmp/) from a work_ver path.
+
+    work_ver is .../tmp/work/<arch>/<recipe>/<ver>/
+    """
+    return work_ver.parent.parent.parent.parent
+
+
+def _resolve_via_work_shared(tmp: Path, tool_name: str, tool_ver: str,
+                             sub_path: str) -> str | None:
+    """Try to find *sub_path* under work-shared/<tool_name>-<tool_ver>*/.
+
+    Returns the resolved absolute path string, or None.
+    """
+    ws = tmp / "work-shared"
+    if not ws.is_dir():
+        return None
+    prefix = f"{tool_name}-{tool_ver}"
+    for d in ws.iterdir():
+        if not d.is_dir() or not d.name.startswith(prefix):
+            continue
+        # Try exact sub-path first: <ws-dir>/<tool-ver-dir>/<sub_path>
+        candidate = d / f"{tool_name}-{tool_ver}" / sub_path
+        if candidate.is_file():
+            return str(candidate)
+        # Try without the nested version dir (some recipes flatten it)
+        candidate = d / sub_path
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def _resolve_csv_abs_path(abs_path: str, rel_path: str,
                           pkg: "PackageInfo") -> str:
     """If *abs_path* doesn't exist on disk, try to find the correct location.
 
-    Handles three categories of mismatched paths:
-    1. gcc-runtime sources embedded under another recipe's src_dir
+    Handles four categories of mismatched paths:
+    1. Toolchain sources (gcc, clang, llvm, …) in work-shared/
     2. Recipe-sysroot headers (usr/include/, usr/lib/)
     3. Build-generated files found by filename search
+    4. Shared-source recipe fallback via work-shared/ filename search
     """
     if os.path.isfile(abs_path):
         return abs_path
@@ -3679,21 +3715,15 @@ def _resolve_csv_abs_path(abs_path: str, rel_path: str,
         return abs_path
 
     work_ver = pkg.work_ver
+    tmp = _get_tmpdir(work_ver)
 
-    # 1. gcc work-shared: rel starts with gcc-X.Y.Z/
-    m = _GCC_VER_RE.match(rel_path)
+    # 1. Toolchain work-shared: rel starts with <name>-<version>/
+    m = _TOOLCHAIN_SRC_RE.match(rel_path)
     if m:
-        gcc_ver, gcc_rel = m.group(1), m.group(2)
-        # work_ver is .../tmp/work/<arch>/<recipe>/<ver>/
-        # work-shared is .../tmp/work-shared/
-        tmp = work_ver.parent.parent.parent.parent  # .../tmp/
-        ws = tmp / "work-shared"
-        if ws.is_dir():
-            for d in ws.iterdir():
-                if d.name.startswith(f"gcc-{gcc_ver}"):
-                    candidate = d / f"gcc-{gcc_ver}" / gcc_rel
-                    if candidate.is_file():
-                        return str(candidate)
+        tool_name, tool_ver, tool_rel = m.group(1), m.group(2), m.group(3)
+        resolved = _resolve_via_work_shared(tmp, tool_name, tool_ver, tool_rel)
+        if resolved:
+            return resolved
         return abs_path
 
     # 2. Sysroot headers: usr/include/ or usr/lib/
@@ -3715,16 +3745,16 @@ def _resolve_csv_abs_path(abs_path: str, rel_path: str,
                 if f.is_file():
                     return str(f)
 
-    # 4. work-shared fallback for gcc-runtime and similar shared-source recipes
-    if pkg.recipe and "gcc" in pkg.recipe:
-        tmp = work_ver.parent.parent.parent.parent
-        ws = tmp / "work-shared"
-        if ws.is_dir():
-            for d in ws.iterdir():
-                if d.is_dir() and d.name.startswith("gcc-"):
-                    for f in d.rglob(filename):
-                        if f.is_file():
-                            return str(f)
+    # 4. work-shared fallback for shared-source recipes (gcc-runtime,
+    #    clang-runtime, libcxx, etc.) — scan all work-shared dirs by filename
+    ws = tmp / "work-shared"
+    if ws.is_dir():
+        for d in ws.iterdir():
+            if not d.is_dir():
+                continue
+            for f in d.rglob(filename):
+                if f.is_file():
+                    return str(f)
 
     return abs_path
 
